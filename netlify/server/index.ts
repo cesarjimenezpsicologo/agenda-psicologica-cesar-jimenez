@@ -23,6 +23,7 @@ export const config = {
 
 const mediaStore = () => getStore({ name: "site-media", consistency: "strong" });
 const boletaStore = () => getStore({ name: "boletas", consistency: "strong" });
+const recoveryStore = () => getStore({ name: "admin-recovery", consistency: "strong" });
 
 const MEDIA = {
   photo: { field: "photoData", contentType: "image/jpeg", defaultUrl: DEFAULT_PHOTO_URL, maxBytes: 1_500_000 },
@@ -46,8 +47,6 @@ app.onError((err, c) => {
   return c.json({ error: "Error interno del servidor. Intenta nuevamente." }, 500);
 });
 
-// ---------- helpers ----------
-
 async function readJson(c: Context): Promise<Record<string, unknown>> {
   try {
     const body = await c.req.json();
@@ -68,7 +67,6 @@ function decodeDataUrl(dataUrl: unknown, allowedTypes: string[]): Uint8Array | n
   return new Uint8Array(Buffer.from(m[2], "base64"));
 }
 
-/** Converts a wall-clock date/time in the practice's timezone to a UTC timestamp. */
 function zonedTimeToUtc(dateISO: string, time: string, timeZone = SITE_TIMEZONE): number {
   const [y, mo, d] = dateISO.split("-").map(Number);
   const [h, mi] = time.split(":").map(Number);
@@ -141,12 +139,10 @@ type AdminEnv = { Variables: { sessionHash: string } };
 
 async function requireAdmin(c: Context<AdminEnv>, next: Next) {
   const sessionHash = await currentSessionHash(c);
-  if (!sessionHash) return c.json({ error: "Sesión de administrador expirada. Ingresa nuevamente." }, 401);
+  if (!sessionHash) return c.json({ error: "Sesión de administrador caducada. Ingresa nuevamente." }, 401);
   c.set("sessionHash", sessionHash);
   await next();
 }
-
-// ---------- public: site content ----------
 
 app.get("/api/config", async (c) => {
   return c.json({ config: await loadConfig() });
@@ -159,12 +155,9 @@ app.get("/api/media/:key", async (c) => {
   if (!data) return c.notFound();
   return c.body(data, 200, {
     "Content-Type": MEDIA[key].contentType,
-    // URLs carry a ?v= version that changes on every upload, so they can be cached long-term.
     "Cache-Control": "public, max-age=31536000, immutable",
   });
 });
-
-// ---------- public: bookings ----------
 
 app.get("/api/availability", async (c) => {
   const rows = await db
@@ -242,12 +235,10 @@ app.post("/api/bookings", async (c) => {
     if (taken) {
       return c.json({ error: "Este horario acaba de ocuparse. Por favor elige otro bloque.", code: "slot_taken" }, 409);
     }
-    // Otherwise the booking code collided with an existing one; try a new code.
   }
   return c.json({ error: "No se pudo generar el código de reserva. Intenta nuevamente." }, 500);
 });
 
-// A patient retrieves the bookings they made on this device (id + private access token).
 app.post("/api/bookings/lookup", async (c) => {
   const body = await readJson(c);
   const items = Array.isArray(body.items) ? body.items.slice(0, 50) : [];
@@ -260,7 +251,6 @@ app.post("/api/bookings/lookup", async (c) => {
   return c.json({ bookings: result });
 });
 
-// Patient (with access token) or admin records the outcome of a bank transfer.
 app.post("/api/bookings/:id/payment", async (c) => {
   const body = await readJson(c);
   const row = await findBooking(c.req.param("id"));
@@ -295,7 +285,6 @@ app.post("/api/bookings/:id/payment", async (c) => {
   return c.json({ error: "Estado de pago no válido." }, 400);
 });
 
-// Patient (with access token) or admin downloads the uploaded SII receipt PDF.
 app.post("/api/bookings/:id/boleta", async (c) => {
   const body = await readJson(c);
   const row = await findBooking(c.req.param("id"));
@@ -307,8 +296,6 @@ app.post("/api/bookings/:id/boleta", async (c) => {
   if (!pdf) return c.json({ error: "Aún no se ha adjuntado la boleta para esta reserva." }, 404);
   return c.body(pdf, 200, { "Content-Type": "application/pdf" });
 });
-
-// ---------- admin: session ----------
 
 app.post("/api/admin/login", async (c) => {
   const body = await readJson(c);
@@ -336,7 +323,94 @@ app.get("/api/admin/session", async (c) => {
   return c.json({ authenticated: Boolean(await currentSessionHash(c)) });
 });
 
-// ---------- admin: protected routes ----------
+app.post("/api/admin/recovery/send", async (c) => {
+  const cfg = await loadConfig();
+  const targetEmail = (process.env.ADMIN_RECOVERY_EMAIL || cfg.email || "cesar.jimenez.psicologo@hotmail.com").trim();
+  const resendKey = process.env.RESEND_API_KEY;
+
+  if (!resendKey) {
+    return c.json(
+      { error: "Falta configurar RESEND_API_KEY en Netlify (Site configuration -> Environment variables) para enviar correos." },
+      500,
+    );
+  }
+
+  const code = String(Math.floor(100000 + Math.random() * 900000));
+  await recoveryStore().setJSON("active-code", {
+    codeHash: sha256(code),
+    expiresAt: Date.now() + 15 * 60 * 1000,
+    attempts: 0,
+  });
+
+  const emailRes = await fetch("https://api.resend.com/emails", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${resendKey}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      from: process.env.RESEND_FROM_EMAIL || "Agenda Ps. César Jiménez <onboarding@resend.dev>",
+      to: [targetEmail],
+      subject: `Código de recuperación de cuenta: ${code}`,
+      html: `
+        <div style="font-family: sans-serif; max-width: 480px; margin: 0 auto; padding: 24px; border: 1px solid #e2e8f0; border-radius: 16px;">
+          <h2 style="color: #0f172a; margin-top: 0;">Recuperación de Acceso Administrador</h2>
+          <p style="color: #475569; font-size: 14px;">Hola César, usa el siguiente código de 6 dígitos para crear una nueva contraseña e ingresar nuevamente a tu página:</p>
+          <div style="background: #f4f7f5; border: 1px solid #c6d7cd; border-radius: 12px; padding: 16px; text-align: center; font-size: 28px; font-weight: bold; letter-spacing: 6px; color: #25362d; margin: 20px 0;">
+            ${code}
+          </div>
+          <p style="color: #64748b; font-size: 12px;">Este código expira en 15 minutos. Si no solicitaste este cambio, ignora este mensaje.</p>
+        </div>
+      `,
+    }),
+  });
+
+  if (!emailRes.ok) {
+    const errDetail = await emailRes.text().catch(() => "");
+    console.error("Resend error:", errDetail);
+    return c.json({ error: "No se pudo enviar el correo. Verifica tu RESEND_API_KEY y correo autorizado." }, 502);
+  }
+
+  return c.json({ ok: true, message: `Código enviado a ${targetEmail}. Revisa tu bandeja de entrada o spam.` });
+});
+
+app.post("/api/admin/recovery/reset", async (c) => {
+  const body = await readJson(c);
+  const code = text(body.code, 10);
+  const newPassword = typeof body.newPassword === "string" ? body.newPassword.trim().slice(0, 200) : "";
+
+  if (!code || code.length < 6) {
+    return c.json({ error: "Ingresa el código de 6 dígitos recibido en tu correo." }, 400);
+  }
+  if (newPassword.length < MIN_PASSWORD_LENGTH) {
+    return c.json({ error: `La nueva contraseña debe tener al menos ${MIN_PASSWORD_LENGTH} caracteres.` }, 400);
+  }
+
+  const record = (await recoveryStore().get("active-code", { type: "json" })) as {
+    codeHash: string;
+    expiresAt: number;
+    attempts: number;
+  } | null;
+
+  if (!record || Date.now() > record.expiresAt) {
+    return c.json({ error: "El código expiró o no existe. Solicita uno nuevo." }, 400);
+  }
+
+  if (record.attempts >= 5) {
+    await recoveryStore().delete("active-code");
+    return c.json({ error: "Demasiados intentos con este código. Solicita uno nuevo." }, 429);
+  }
+
+  if (sha256(code) !== record.codeHash) {
+    await recoveryStore().setJSON("active-code", { ...record, attempts: record.attempts + 1 });
+    return c.json({ error: "Código de verificación incorrecto." }, 400);
+  }
+
+  await recoveryStore().delete("active-code");
+  await changePassword(newPassword, null);
+  await createSession(c);
+  return c.json({ ok: true });
+});
 
 const admin = new Hono<AdminEnv>();
 admin.use("*", requireAdmin);
